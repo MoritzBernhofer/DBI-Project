@@ -6,9 +6,14 @@
  * TL;DR - This is where all the tRPC server stuff is created and plugged in. The pieces you will
  * need to use are documented accordingly near the end.
  */
-import { initTRPC } from "@trpc/server";
+import { type CreateNextContextOptions } from "@trpc/server/adapters/next";
+import { initTRPC, TRPCError } from "@trpc/server";
 import superjson from "superjson";
 import { ZodError } from "zod";
+import { db } from "../data";
+import { decodeAndVerifyJwtToken } from "../auth/decodeAndVerifyJwtToken";
+import { BLOG_USERS_COLLECTION, type BlogUser } from "../data/models";
+import type { AppJwtPayload } from "../auth/claims";
 
 /**
  * 1. CONTEXT
@@ -22,9 +27,28 @@ import { ZodError } from "zod";
  *
  * @see https://trpc.io/docs/server/context
  */
-export const createTRPCContext = async (opts: { headers: Headers }) => {
+export const createTRPCContext = async ({ req }: CreateNextContextOptions) => {
+  async function getPayloadFromHeader() {
+    if (!req) {
+      return null;
+    }
+
+    if (!req.headers.authorization) {
+      return null;
+    }
+
+    const tokenPayload = decodeAndVerifyJwtToken(
+      req.headers.authorization.split(" ")[1] ?? "", // "Bearer <token>"
+    );
+
+    return tokenPayload;
+  }
+
+  const tokenPayload = await getPayloadFromHeader();
+
   return {
-    ...opts,
+    tokenPayload,
+    db,
   };
 };
 
@@ -101,3 +125,32 @@ const timingMiddleware = t.middleware(async ({ next, path }) => {
  * are logged in.
  */
 export const publicProcedure = t.procedure.use(timingMiddleware);
+
+const authenticationMiddleware = t.middleware(async ({ next, ctx }) => {
+  if (ctx.tokenPayload === null) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+
+  const usersCollection = ctx.db.collection<BlogUser>(BLOG_USERS_COLLECTION);
+  const user = await usersCollection.findOne({
+    username: ctx.tokenPayload.claims.username,
+  });
+
+  if (user === null) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+
+  return await next({
+    ctx: { ...ctx, user },
+  });
+});
+
+/**
+ * Private (authenticated) procedure
+ *
+ * This is the base piece you use to build new queries and mutations on your tRPC API. It does
+ * guarantee that a user querying is authorized.
+ */
+export const protectedProcedure = t.procedure
+  .use(timingMiddleware)
+  .use(authenticationMiddleware);
